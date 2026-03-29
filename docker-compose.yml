@@ -1,0 +1,87 @@
+version: '3.9'
+
+services:
+  proxy:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3128:3128"
+    environment:
+      # ── AnyIP.io credentials ──────────────────────────────
+      ANYIP_USERNAME:        ${ANYIP_USERNAME}
+      ANYIP_PASSWORD:        ${ANYIP_PASSWORD}
+
+      # ── Proxy type: mobile | residential | both ───────────
+      ANYIP_PROXY_TYPE:      ${ANYIP_PROXY_TYPE:-mobile}
+
+      # ── Sticky session duration in minutes ────────────────
+      ANYIP_SESSION_MINUTES: ${ANYIP_SESSION_MINUTES:-4320}
+
+      # ── Optional geo-targeting ────────────────────────────
+      ANYIP_COUNTRY:         ${ANYIP_COUNTRY:-}
+      ANYIP_CITY:            ${ANYIP_CITY:-}
+
+      # ── Session mode: sticky | rotating ──────────────────
+      ANYIP_SESSION_MODE:    ${ANYIP_SESSION_MODE:-sticky}
+
+      # ── Prevent same IP across sessions ───────────────────
+      ANYIP_STRICT_COLLISION: ${ANYIP_STRICT_COLLISION:-false}
+
+      # ── Allow auto-replace when peer goes offline ─────────
+      ANYIP_SESSION_REPLACE: ${ANYIP_SESSION_REPLACE:-true}
+
+      # ── Enforce same ISP/ASN on peer replacement ──────────
+      ANYIP_SESSION_ASN_STRICT: ${ANYIP_SESSION_ASN_STRICT:-false}
+
+      # ── anyip.io Change IP URL (optional) ────────────────
+      ANYIP_PROXY_ID:        ${ANYIP_PROXY_ID:-}
+      ANYIP_INVALIDATE_HASH: ${ANYIP_INVALIDATE_HASH:-}
+
+      # ── Session salt (change this!) ───────────────────────
+      ANYIP_SESSION_SALT:    ${ANYIP_SESSION_SALT:-changeme}
+
+      # ── Session persistence path ──────────────────────────
+      SESSION_STORE_PATH:    /var/lib/proxy/sessions.json
+
+      # ── Logging ───────────────────────────────────────────
+      LOG_LEVEL:             ${LOG_LEVEL:-info}
+
+      # ── Auto-rotate + retry on 407 ───────────────────────────
+      AUTO_ROTATE_ON_ERROR:  ${AUTO_ROTATE_ON_ERROR:-true}
+
+      # ── Session ID header override ────────────────────────
+      SESSION_ID_HEADER:     ${SESSION_ID_HEADER:-X-Session-ID}
+
+      # ── DNS cache TTL (seconds) ───────────────────────────
+      DNS_TTL:               ${DNS_TTL:-300}
+
+      # ── Workers — set to 1 on free-tier hosts (1 shared vCPU) ───
+      PROXY_WORKERS:         ${PROXY_WORKERS:-1}
+
+      # ── Per-IP connection limit ────────────────────────────
+      MAX_CONNS_PER_IP:      ${MAX_CONNS_PER_IP:-50}
+
+    volumes:
+      # Persist sessions across container restarts
+      - proxy_sessions:/var/lib/proxy
+
+    # ── File-descriptor limit (1000 clients + 1000 upstream = 2000+ FDs needed)
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+    # ── Kernel tuning for high connection counts
+    sysctls:
+      net.ipv4.tcp_tw_reuse: 1
+      net.core.somaxconn: 4096
+
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.create_connection(('127.0.0.1',3128),2); s.close()\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  proxy_sessions:
