@@ -28,14 +28,14 @@ jobs:
         uses: actions/checkout@main
 
       - name: Set up QEMU (for multi-platform builds)
-        uses: docker/setup-qemu-action@main
+        uses: docker/setup-qemu-action@master
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@main
+        uses: docker/setup-buildx-action@master
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@main
+        uses: docker/login-action@master
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -43,7 +43,7 @@ jobs:
 
       - name: Extract metadata (tags & labels)
         id: meta
-        uses: docker/metadata-action@main
+        uses: docker/metadata-action@master
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -59,7 +59,7 @@ jobs:
             type=ref,event=branch
 
       - name: Build and push
-        uses: docker/build-push-action@main
+        uses: docker/build-push-action@master
         with:
           context: .
           platforms: linux/amd64,linux/arm64
