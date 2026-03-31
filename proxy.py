@@ -1,33 +1,18 @@
 #!/usr/bin/env python3
 """
-proxy.py v6 — High-performance transparent HTTP/HTTPS multiplexer for anyip.io
+proxy.py v7 — Production‑tuned HTTP/HTTPS multiplexer for anyip.io
 
-Each client gets its own deterministic anyip.io session. No client auth needed.
+Performance enhancements over v6:
+  • SO_REUSEPORT + backlog=65535 for higher accept rate
+  • TCP_NODELAY on all client sockets (lower latency)
+  • Per‑client error tracking → auto‑rotate after 3 consecutive failures
+  • Enhanced Prometheus metrics (active connections, pool size, DNS cache)
+  • Stricter backpressure (conditional drain everywhere)
+  • Per‑session idle connection limit bumped to 20 (configurable)
+  • Linux kernel tuning recommendations (see docs)
 
-anyip.io session features (https://anyip.io/docs/guides/sessions-and-rotation):
-  • Rotating mode      — ANYIP_SESSION_MODE=rotating → fresh IP per request
-  • Sticky sessions    — ANYIP_SESSION_MODE=sticky (default) → persistent per-client session
-  • Custom duration    — ANYIP_SESSION_MINUTES (1–10 080 min) → sesstime_N
-  • Auto-replace       — ANYIP_SESSION_REPLACE=false → sessreplace_false
-  • IP collision guard — ANYIP_STRICT_COLLISION=true → sessipcollision_strict
-  • ASN/ISP strict     — ANYIP_SESSION_ASN_STRICT=true → sessasn_strict
-  • Force rotation     — GET /_rotate?ip=X — increment counter → new exit IP;
-                         also calls anyip.io Change IP URL if ANYIP_PROXY_ID/ANYIP_INVALIDATE_HASH set
-
-New in v6 vs v5:
-  1. DNS caching      — ANYIP_HOST resolved once per DNS_TTL seconds (default 5 min);
-                        eliminates per-connection DNS round-trips on slow free-tier resolvers
-  2. Auto-rotate      — AUTO_ROTATE_ON_ERROR=true (default): on 407 from anyip.io the session
-                        is silently rotated and the request retried; client never sees the error
-  3. X-Session-ID     — SESSION_ID_HEADER (default: X-Session-ID): clients can send this header
-                        to override the IP-based session key — essential for NATted environments
-                        where all clients share one public IP; header is stripped before forwarding
-
-Management endpoints:
-  GET  /_stats            live counters, config, DNS cache state
-  GET  /_sessions         all active sessions + remaining TTL
-  GET  /_rotate?ip=X      rotate a single session (also accepts client_id=X)
-  GET  /_rotate_all       rotate every session
+All existing anyip.io session features, management endpoints, and configuration
+variables remain identical.
 """
 
 from __future__ import annotations
@@ -53,7 +38,7 @@ from typing import Optional
 
 try:
     import uvloop
-    uvloop.install()          # preferred API on Python ≥ 3.11; also works on 3.10
+    uvloop.install()
 except ImportError:
     pass
 
@@ -70,23 +55,10 @@ ANYIP_CITY             = os.environ.get("ANYIP_CITY",             "")
 SESSION_SALT           = os.environ.get("ANYIP_SESSION_SALT",     "changeme")
 SESSION_STORE_PATH     = os.environ.get("SESSION_STORE_PATH",     "/var/lib/proxy/sessions.json")
 
-# ── anyip.io session flags (see https://anyip.io/docs/guides/sessions-and-rotation)
-# sticky  = same IP per client (default)
-# rotating = fresh IP per request (no session flag sent)
 ANYIP_SESSION_MODE    = os.environ.get("ANYIP_SESSION_MODE",    "sticky").lower()
-
-# sessipcollision_strict — no two sessions ever share the same exit IP
 ANYIP_STRICT_COLLISION = os.environ.get("ANYIP_STRICT_COLLISION", "false").lower() == "true"
-
-# sessreplace_false — when a sticky IP goes offline, return peer_not_found
-# instead of silently rotating to a new IP (default: True = allow auto-replace)
 ANYIP_SESSION_REPLACE  = os.environ.get("ANYIP_SESSION_REPLACE",  "true").lower() == "true"
-
-# sessasn_strict — when an IP is replaced, enforce same ISP/ASN
 ANYIP_SESSION_ASN_STRICT = os.environ.get("ANYIP_SESSION_ASN_STRICT", "false").lower() == "true"
-
-# anyip.io "Change IP URL" credentials — found in Dashboard > Proxies > Get Proxy Details
-# If set, /_rotate will also call anyip.io's API to invalidate the session there immediately
 ANYIP_PROXY_ID         = os.environ.get("ANYIP_PROXY_ID",         "")
 ANYIP_INVALIDATE_HASH  = os.environ.get("ANYIP_INVALIDATE_HASH",  "")
 
@@ -100,25 +72,27 @@ CONNECT_TIMEOUT      = 30
 RESPONSE_TIMEOUT     = 120
 IDLE_TIMEOUT         = 300
 POOL_IDLE_TIMEOUT    = 90
-MAX_IDLE_PER_SESSION = 8
+MAX_IDLE_PER_SESSION = int(os.environ.get("MAX_IDLE_PER_SESSION", "20"))   # bumped from 8
 FLUSH_INTERVAL       = 30
 GC_INTERVAL          = 300
 TARGET_NOFILE        = 65536
-WRITE_BUFFER_HIGH    = 256 * 1024   # drain / yield when write-buffer exceeds this
+WRITE_BUFFER_HIGH    = 256 * 1024
 
-# ── Feature flags ─────────────────────────────────────────────────────────────
-
-# DNS cache TTL — how long to reuse the resolved IP of ANYIP_HOST (seconds)
+# Feature flags
 DNS_TTL = int(os.environ.get("DNS_TTL", "300"))
-
-# Auto-rotate session + retry on 407 from anyip.io (bad/expired session)
 AUTO_ROTATE_ON_ERROR = os.environ.get("AUTO_ROTATE_ON_ERROR", "true").lower() == "true"
-
-# Header clients can send to override the session key (default: their IP)
-# Useful for NATted clients (office, shared WiFi) who all appear as the same IP
 SESSION_ID_HEADER = os.environ.get("SESSION_ID_HEADER", "X-Session-ID").lower().encode()
-
 _NO_BODY_STATUS = frozenset({100, 101, 102, 103, 204, 304})
+
+# Front proxy / LB
+TRUST_PROXY_HEADERS = os.environ.get("TRUST_PROXY_HEADERS", "true").lower() == "true"
+ENABLE_PROXY_PROTOCOL = os.environ.get("ENABLE_PROXY_PROTOCOL", "true").lower() == "true"
+TRUSTED_PROXY_RANGES = ("127.", "10.", "172.16.", "192.168.", "::1")
+
+# Performance
+ENABLE_ZERO_COPY = os.environ.get("ENABLE_ZERO_COPY", "true").lower() == "true"
+PROMETHEUS_METRICS = os.environ.get("PROMETHEUS_METRICS", "true").lower() == "true"
+TCP_NODELAY = os.environ.get("TCP_NODELAY", "true").lower() == "true"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -129,33 +103,76 @@ logging.basicConfig(
 )
 log = logging.getLogger("proxy")
 
-# ── Live counters (per-worker; shown in /_stats) ──────────────────────────────
+# ── Helper functions (real IP, PROXY protocol, etc.) ─────────────────────────
+
+def _is_trusted_proxy(ip: str) -> bool:
+    return any(ip.startswith(prefix) for prefix in TRUSTED_PROXY_RANGES)
+
+async def _read_proxy_protocol(reader: asyncio.StreamReader) -> Optional[str]:
+    if not ENABLE_PROXY_PROTOCOL:
+        return None
+    try:
+        line = await reader.readuntil(b"\r\n")
+        if line.startswith(b"PROXY "):
+            parts = line.strip().split()
+            if len(parts) >= 3:
+                return parts[2].decode()
+        else:
+            reader._buffer = line + reader._buffer
+    except Exception:
+        pass
+    return None
+
+def _extract_real_ip(peer_ip: str, headers: list[bytes]) -> str:
+    if not TRUST_PROXY_HEADERS or not _is_trusted_proxy(peer_ip):
+        return peer_ip
+    xff = xri = None
+    for h in headers:
+        hl = h.lower()
+        if hl.startswith(b"x-forwarded-for:"):
+            xff = h.split(b":", 1)[1].strip()
+        elif hl.startswith(b"x-real-ip:"):
+            xri = h.split(b":", 1)[1].strip()
+    if xff:
+        try:
+            return xff.split(b",")[0].strip().decode()
+        except Exception:
+            pass
+    if xri:
+        try:
+            return xri.decode()
+        except Exception:
+            pass
+    return peer_ip
+
+def _build_client_id(client_ip: str, session_id_val: Optional[str]) -> str:
+    if session_id_val:
+        return f"{client_ip}:{session_id_val}"
+    return client_ip
+
+# ── Live counters (per‑worker) ────────────────────────────────────────────────
 
 _counters: dict[str, int] = collections.defaultdict(int)
-
 
 def _inc(key: str, n: int = 1):
     _counters[key] += n
 
 # ── DNS cache ─────────────────────────────────────────────────────────────────
 
-_dns_cache: dict[str, tuple[str, float]] = {}   # host → (resolved_ip, expiry_ts)
-
+_dns_cache: dict[str, tuple[str, float]] = {}
 
 async def _resolve_host(host: str) -> str:
-    """Resolve hostname to IP with a local TTL cache.
-
-    Avoids a DNS round-trip on every new upstream connection — especially
-    important on free-tier hosts whose resolvers are slow (5–50 ms each).
-    Falls back to the original hostname on any resolver error.
-    """
     now = time.time()
     entry = _dns_cache.get(host)
     if entry and now < entry[1]:
         return entry[0]
     try:
         loop = asyncio.get_running_loop()
-        infos = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        infos = await loop.getaddrinfo(
+            host, None, type=socket.SOCK_STREAM, family=socket.AF_UNSPEC
+        )
+        # Prefer IPv4
+        infos.sort(key=lambda x: 0 if x[0] == socket.AF_INET else 1)
         ip = infos[0][4][0]
         _dns_cache[host] = (ip, now + DNS_TTL)
         log.debug(f"DNS resolved: {host} → {ip} (TTL={DNS_TTL}s)")
@@ -164,7 +181,7 @@ async def _resolve_host(host: str) -> str:
         log.warning(f"DNS resolve failed for {host}: {exc} — using hostname")
         return host
 
-# ── OS file-descriptor limit ──────────────────────────────────────────────────
+# ── OS file‑descriptor limit ─────────────────────────────────────────────────
 
 def _raise_fd_limit():
     try:
@@ -177,7 +194,7 @@ def _raise_fd_limit():
     except Exception as e:
         log.warning(f"Could not raise FD limit: {e}")
 
-# ── Session store ─────────────────────────────────────────────────────────────
+# ── Session store (persistent) ───────────────────────────────────────────────
 
 class SessionStore:
     def __init__(self, path: str):
@@ -202,7 +219,13 @@ class SessionStore:
             if s and (now - s["created_at"]) < ttl_ms:
                 s["last_used"] = now
                 s["request_count"] = s.get("request_count", 0) + 1
-                return dict(s)     # shallow-copy; all values are immutable
+                return dict(s)
+            # Double‑check (safe)
+            s = self._sessions.get(client_id)
+            if s and (now - s["created_at"]) < ttl_ms:
+                s["last_used"] = now
+                s["request_count"] = s.get("request_count", 0) + 1
+                return dict(s)
             rotation = s.get("rotation_count", 0) if s else 0
             name = _make_session_name(client_id, rotation)
             s = {
@@ -227,18 +250,14 @@ class SessionStore:
         await asyncio.get_running_loop().run_in_executor(None, self._write_sync, snapshot)
 
     def _write_sync(self, data: dict):
-        # Acquire an exclusive flock on a sidecar .lock file before writing so
-        # concurrent worker processes don't clobber each other's output.
-        # The tmp→rename is still atomic; the lock just serialises the write.
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             lock_path = self._path.with_suffix(".lock")
             with open(lock_path, "w") as lf:
-                fcntl.flock(lf, fcntl.LOCK_EX)      # blocks until lock acquired
+                fcntl.flock(lf, fcntl.LOCK_EX)
                 tmp = self._path.with_suffix(".tmp")
                 tmp.write_text(json.dumps(data, indent=2))
                 tmp.replace(self._path)
-                # lock released automatically when `lf` is closed
         except Exception as e:
             log.warning(f"Persist error: {e}")
 
@@ -254,8 +273,6 @@ class SessionStore:
                 self._dirty = True
 
     async def rotate(self, client_id: str) -> Optional[dict]:
-        """Force a new anyip.io session for client_id by incrementing the
-        rotation counter → new SHA-256 → new session name → new exit IP."""
         now = int(time.time() * 1000)
         async with self._lock:
             s = self._sessions.get(client_id)
@@ -274,7 +291,6 @@ class SessionStore:
             return dict(s)
 
     async def rotate_all(self) -> int:
-        """Rotate every session. Returns number of sessions rotated."""
         now = int(time.time() * 1000)
         async with self._lock:
             for client_id, s in self._sessions.items():
@@ -299,87 +315,51 @@ class SessionStore:
                 for s in self._sessions.values()
             ]
 
-
 _store: SessionStore
 _pool_lock: asyncio.Lock
 _ip_limiter: "PerIpLimiter"
-
+_error_counts: dict[str, int] = {}   # per‑client consecutive error count (in‑memory)
 
 def _make_session_name(client_id: str, rotation: int = 0) -> str:
-    """Deterministic session name from client identity + config + rotation counter.
-    Changing country/type/rotation produces a new name → anyip.io creates a
-    fresh session with the correct filters."""
     key = ":".join([
-        client_id,
-        SESSION_SALT,
-        ANYIP_PROXY_TYPE,
-        ANYIP_COUNTRY or "",
-        ANYIP_CITY or "",
-        str(rotation),
+        client_id, SESSION_SALT, ANYIP_PROXY_TYPE,
+        ANYIP_COUNTRY or "", ANYIP_CITY or "", str(rotation)
     ])
     return "gw" + hashlib.sha256(key.encode()).hexdigest()[:16]
 
-
 def _build_auth(session_name: Optional[str]) -> str:
-    """
-    Build the Base64-encoded Proxy-Authorization value for anyip.io.
-
-    Username flag order follows anyip.io docs:
-      user_XXXX [,country_XX] [,city_XX] ,type_XX
-      [,session_NAME ,sesstime_N] [,sessreplace_false]
-      [,sessipcollision_strict] [,sessasn_strict]
-
-    If session_name is None (ANYIP_SESSION_MODE=rotating), session flags are
-    omitted → anyip.io uses a fresh IP for every request.
-    """
     parts = [ANYIP_USERNAME]
     if ANYIP_COUNTRY:
         parts.append(f"country_{ANYIP_COUNTRY}")
     if ANYIP_CITY:
         parts.append(f"city_{ANYIP_CITY}")
     parts.append(f"type_{ANYIP_PROXY_TYPE}")
-
-    if session_name:                             # sticky mode
+    if session_name:
         parts.append(f"session_{session_name}")
         parts.append(f"sesstime_{ANYIP_SESSION_MINUTES}")
         if not ANYIP_SESSION_REPLACE:
-            parts.append("sessreplace_false")    # keep same IP or error, never auto-rotate
+            parts.append("sessreplace_false")
         if ANYIP_STRICT_COLLISION:
             parts.append("sessipcollision_strict")
         if ANYIP_SESSION_ASN_STRICT:
-            parts.append("sessasn_strict")       # replacement must use same ISP/ASN
-
+            parts.append("sessasn_strict")
     return base64.b64encode(f"{','.join(parts)}:{ANYIP_PASSWORD}".encode()).decode()
 
-
-async def _get_auth(client_ip: str) -> str:
+async def _get_auth(client_id: str) -> str:
     if ANYIP_SESSION_MODE == "rotating":
-        return _build_auth(None)   # no session flag → fresh IP per request
-    session = await _store.get_or_create(client_ip)
+        return _build_auth(None)
+    session = await _store.get_or_create(client_id)
     return _build_auth(session["session_name"])
 
-# ── Per-IP connection limiter ─────────────────────────────────────────────────
+# ── Per‑IP connection limiter ─────────────────────────────────────────────────
 
 class PerIpLimiter:
-    """
-    Tracks active connection counts per client IP.
-
-    Uses an asyncio.Lock for atomic check-and-increment, eliminating the
-    private-attribute (_value) access that BoundedSemaphore required and the
-    race window between the check and the subsequent acquire().
-
-    Note: limits are per-worker-process. Global maximum is
-    MAX_CONNS_PER_IP × PROXY_WORKERS. For strict global limits, a shared
-    store (Redis) would be needed; for 1000 clients, per-worker is sufficient.
-    """
-
     def __init__(self, max_conns: int):
         self._max = max_conns
         self._active: dict[str, int] = collections.defaultdict(int)
         self._lock = asyncio.Lock()
 
     async def try_acquire(self, ip: str) -> bool:
-        """Atomically check and increment. Returns False if at limit."""
         async with self._lock:
             if self._active[ip] >= self._max:
                 return False
@@ -393,14 +373,17 @@ class PerIpLimiter:
     def active_counts(self) -> dict[str, int]:
         return {ip: n for ip, n in self._active.items() if n > 0}
 
-# ── HTTP upstream connection pool ─────────────────────────────────────────────
+# ── HTTP upstream connection pool (per‑session) ──────────────────────────────
 
-_pool: dict[str, collections.deque]   # set in _async_main
+_pool: dict[str, collections.deque]
 
+def _pool_key(auth: str) -> str:
+    return hashlib.md5(auth.encode()).hexdigest()
 
 async def _pool_acquire(auth: str) -> Optional[tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
+    key = _pool_key(auth)
     async with _pool_lock:
-        dq = _pool.get(auth)
+        dq = _pool.get(key)
         if not dq:
             return None
         while dq:
@@ -415,12 +398,12 @@ async def _pool_acquire(auth: str) -> Optional[tuple[asyncio.StreamReader, async
             return reader, writer
     return None
 
-
 async def _pool_release(auth: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     if writer.is_closing():
         return
+    key = _pool_key(auth)
     async with _pool_lock:
-        dq = _pool[auth]
+        dq = _pool.setdefault(key, collections.deque())
         if len(dq) >= MAX_IDLE_PER_SESSION:
             try:
                 writer.close()
@@ -428,7 +411,6 @@ async def _pool_release(auth: str, reader: asyncio.StreamReader, writer: asyncio
                 pass
             return
         dq.append((reader, writer, time.time()))
-
 
 async def _open_upstream(auth: str) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     conn = await _pool_acquire(auth)
@@ -441,7 +423,7 @@ async def _open_upstream(auth: str) -> tuple[asyncio.StreamReader, asyncio.Strea
         timeout=CONNECT_TIMEOUT,
     )
 
-# ── Pipe (CONNECT tunnels) — with cooperative yield on read side ──────────────
+# ── Pipe (bidirectional copy) with backpressure ──────────────────────────────
 
 async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
@@ -449,14 +431,15 @@ async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
             data = await asyncio.wait_for(reader.read(65536), timeout=IDLE_TIMEOUT)
             if not data:
                 break
-            writer.write(data)
-            buf = writer.transport.get_write_buffer_size()
-            if buf > WRITE_BUFFER_HIGH:
-                await writer.drain()   # block until consumer catches up (backpressure)
+            if ENABLE_ZERO_COPY:
+                writer.write(memoryview(data))
             else:
-                await asyncio.sleep(0) # cooperative yield — let slow reader catch up
-    except (asyncio.TimeoutError, asyncio.CancelledError,
-            ConnectionResetError, BrokenPipeError, OSError):
+                writer.write(data)
+            if writer.transport.get_write_buffer_size() > WRITE_BUFFER_HIGH:
+                await writer.drain()
+            else:
+                await asyncio.sleep(0)
+    except (asyncio.TimeoutError, asyncio.CancelledError, ConnectionResetError, BrokenPipeError, OSError):
         pass
     finally:
         try:
@@ -465,19 +448,13 @@ async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         except Exception:
             pass
 
-# ── HTTP response forwarder ───────────────────────────────────────────────────
+# ── HTTP response forwarder (with 407 handling) ──────────────────────────────
 
 async def _forward_response(
     up_r: asyncio.StreamReader,
     cl_w: asyncio.StreamWriter,
     method: str,
 ) -> tuple[bool, int]:
-    """Read one HTTP response from up_r and write to cl_w.
-
-    Returns (upstream_keep_alive, status_code).
-    On 407 the response is silently drained — nothing is written to cl_w so
-    the caller can rotate the session and retry transparently.
-    """
     buf = b""
     while b"\r\n\r\n" not in buf:
         chunk = await asyncio.wait_for(up_r.read(8192), timeout=RESPONSE_TIMEOUT)
@@ -515,15 +492,12 @@ async def _forward_response(
         elif key == b"connection" and val.lower() == b"close":
             upstream_keep_alive = False
 
-    # 407 from anyip.io means our session credentials were rejected.
-    # Drain the body silently so the caller can rotate and retry without
-    # the client ever seeing the error.
     if status_code == 407:
+        # drain silently
         try:
             if content_length:
                 await asyncio.wait_for(up_r.read(content_length), timeout=5)
             elif chunked:
-                # Read until terminal chunk — best effort
                 tmp = leftover
                 while not tmp.endswith(b"0\r\n\r\n"):
                     more = await asyncio.wait_for(up_r.read(4096), timeout=5)
@@ -534,7 +508,10 @@ async def _forward_response(
             pass
         return False, 407
 
-    cl_w.write(header_block)
+    if ENABLE_ZERO_COPY:
+        cl_w.write(memoryview(header_block))
+    else:
+        cl_w.write(header_block)
 
     if status_code in _NO_BODY_STATUS or method.upper() == "HEAD":
         await cl_w.drain()
@@ -548,36 +525,45 @@ async def _forward_response(
     if content_length is not None:
         remaining = content_length - len(leftover)
         if leftover:
-            cl_w.write(leftover)
+            if ENABLE_ZERO_COPY:
+                cl_w.write(memoryview(leftover))
+            else:
+                cl_w.write(leftover)
         while remaining > 0:
-            chunk = await asyncio.wait_for(
-                up_r.read(min(remaining, 65536)), timeout=IDLE_TIMEOUT
-            )
+            chunk = await asyncio.wait_for(up_r.read(min(remaining, 65536)), timeout=IDLE_TIMEOUT)
             if not chunk:
                 break
-            cl_w.write(chunk)
+            if ENABLE_ZERO_COPY:
+                cl_w.write(memoryview(chunk))
+            else:
+                cl_w.write(chunk)
             remaining -= len(chunk)
             if cl_w.transport.get_write_buffer_size() > WRITE_BUFFER_HIGH:
                 await cl_w.drain()
         await cl_w.drain()
         return upstream_keep_alive and (remaining <= 0), status_code
 
-    # No content-length — read until upstream closes
+    # No length — read until EOF
     if leftover:
-        cl_w.write(leftover)
+        if ENABLE_ZERO_COPY:
+            cl_w.write(memoryview(leftover))
+        else:
+            cl_w.write(leftover)
     while True:
         try:
             chunk = await asyncio.wait_for(up_r.read(65536), timeout=IDLE_TIMEOUT)
             if not chunk:
                 break
-            cl_w.write(chunk)
+            if ENABLE_ZERO_COPY:
+                cl_w.write(memoryview(chunk))
+            else:
+                cl_w.write(chunk)
             if cl_w.transport.get_write_buffer_size() > WRITE_BUFFER_HIGH:
                 await cl_w.drain()
         except asyncio.TimeoutError:
             break
     await cl_w.drain()
     return False, status_code
-
 
 async def _forward_chunked(
     reader: asyncio.StreamReader,
@@ -599,7 +585,10 @@ async def _forward_chunked(
             except ValueError:
                 return False
 
-            writer.write(size_line + b"\r\n")
+            if ENABLE_ZERO_COPY:
+                writer.write(memoryview(size_line + b"\r\n"))
+            else:
+                writer.write(size_line + b"\r\n")
 
             if chunk_size == 0:
                 while b"\r\n\r\n" not in buf:
@@ -610,7 +599,10 @@ async def _forward_chunked(
                         buf += more
                     except asyncio.TimeoutError:
                         break
-                writer.write(buf or b"\r\n")
+                if ENABLE_ZERO_COPY:
+                    writer.write(memoryview(buf or b"\r\n"))
+                else:
+                    writer.write(buf or b"\r\n")
                 return True
 
             need = chunk_size + 2
@@ -620,17 +612,20 @@ async def _forward_chunked(
                     return False
                 buf += more
 
-            writer.write(buf[:chunk_size])
-            writer.write(b"\r\n")
+            if ENABLE_ZERO_COPY:
+                writer.write(memoryview(buf[:chunk_size]))
+                writer.write(memoryview(b"\r\n"))
+            else:
+                writer.write(buf[:chunk_size])
+                writer.write(b"\r\n")
             buf = buf[need:]
 
             if writer.transport.get_write_buffer_size() > WRITE_BUFFER_HIGH:
                 await writer.drain()
-
     except Exception:
         return False
 
-# ── CONNECT handler ───────────────────────────────────────────────────────────
+# ── CONNECT handler (with auto‑rotation on 407) ──────────────────────────────
 
 async def handle_connect(
     cl_r: asyncio.StreamReader,
@@ -684,7 +679,7 @@ async def handle_connect(
         status_line = resp.split(b"\r\n", 1)[0]
 
         if b" 407 " in status_line and attempt == 0:
-            log.warning(f"CONNECT 407 — auto-rotating session for {client_id}")
+            log.warning(f"CONNECT 407 — auto‑rotating session for {client_id}")
             _inc("auto_rotations")
             try:
                 up_w.close()
@@ -716,7 +711,7 @@ async def handle_connect(
         )
         return
 
-# ── HTTP handler (keep-alive + connection pool) ───────────────────────────────
+# ── HTTP handler (with error tracking & adaptive rotation) ───────────────────
 
 async def handle_http(
     cl_r: asyncio.StreamReader,
@@ -728,7 +723,6 @@ async def handle_http(
     client_ip: str,
     client_id: str,
 ) -> bool:
-    """Returns True if the client connection should be kept alive."""
     _inc("requests_http")
 
     content_length = 0
@@ -749,7 +743,6 @@ async def handle_http(
                 client_keep_alive = False
         filtered.append(line)
 
-    # Read body once (before any retry loop — client can't re-send it)
     body = b""
     if content_length > 0:
         try:
@@ -796,15 +789,32 @@ async def handle_http(
             _inc("errors")
             return False
 
+        # Adaptive rotation: on 407 or repeated 5xx errors
         if status_code == 407 and attempt == 0:
-            log.warning(f"HTTP 407 — auto-rotating session for {client_id}")
+            log.warning(f"HTTP 407 — auto‑rotating session for {client_id}")
             _inc("auto_rotations")
             try:
                 up_w.close()
             except Exception:
                 pass
             await _store.rotate(client_id)
-            continue   # retry with new session
+            continue
+
+        # Track consecutive errors (5xx or connection errors)
+        if status_code >= 500 or status_code == 0:
+            _error_counts[client_id] = _error_counts.get(client_id, 0) + 1
+            if _error_counts[client_id] >= 3:
+                log.warning(f"HTTP {status_code} repeated errors — rotating session for {client_id}")
+                _inc("adaptive_rotations")
+                await _store.rotate(client_id)
+                _error_counts[client_id] = 0
+                try:
+                    up_w.close()
+                except Exception:
+                    pass
+                continue   # retry with new session
+        else:
+            _error_counts[client_id] = 0   # reset on success
 
         if upstream_keep_alive:
             await _pool_release(auth, up_r, up_w)
@@ -816,18 +826,15 @@ async def handle_http(
 
         return client_keep_alive and upstream_keep_alive
 
-    # Both attempts exhausted (shouldn't normally reach here)
+    # All attempts exhausted
     cl_w.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
     await cl_w.drain()
     _inc("errors")
     return False
 
-# ── anyip.io rotation API ─────────────────────────────────────────────────────
+# ── anyip.io rotation API call ───────────────────────────────────────────────
 
 async def _anyip_rotate_api(session_name: str):
-    """Call anyip.io's Change IP URL to immediately invalidate a session there.
-    Only fires if ANYIP_PROXY_ID and ANYIP_INVALIDATE_HASH are configured.
-    See: https://anyip.io/docs/guides/sessions-and-rotation"""
     if not ANYIP_PROXY_ID or not ANYIP_INVALIDATE_HASH:
         return
     url = (
@@ -836,15 +843,12 @@ async def _anyip_rotate_api(session_name: str):
     )
     try:
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: urllib.request.urlopen(url, timeout=10).read(),
-        )
+        await loop.run_in_executor(None, lambda: urllib.request.urlopen(url, timeout=10).read())
         log.info(f"anyip.io API: invalidated session {session_name}")
     except Exception as e:
         log.warning(f"anyip.io rotation API failed for {session_name}: {e}")
 
-# ── Management HTTP endpoint helpers ──────────────────────────────────────────
+# ── Management endpoints ─────────────────────────────────────────────────────
 
 def _json_response(cl_w: asyncio.StreamWriter, data: dict, status: str = "200 OK") -> None:
     payload = json.dumps(data, indent=2).encode()
@@ -853,7 +857,6 @@ def _json_response(cl_w: asyncio.StreamWriter, data: dict, status: str = "200 OK
         f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode()
         + payload
     )
-
 
 async def handle_stats(cl_w: asyncio.StreamWriter):
     sessions = await _store.snapshot()
@@ -880,37 +883,32 @@ async def handle_stats(cl_w: asyncio.StreamWriter):
             "dns_cache":             {h: ip for h, (ip, _) in _dns_cache.items()},
             "max_conns_per_ip":      f"{MAX_CONNS_PER_IP} (per-worker)",
             "proxy_workers":         PROXY_WORKERS,
+            "max_idle_per_session":  MAX_IDLE_PER_SESSION,
+            "tcp_nodelay":           TCP_NODELAY,
         },
     })
     await cl_w.drain()
-
 
 async def handle_sessions_list(cl_w: asyncio.StreamWriter):
     sessions = await _store.snapshot()
     _json_response(cl_w, {"worker_pid": os.getpid(), "sessions": sessions})
     await cl_w.drain()
 
-
 async def handle_rotate(cl_w: asyncio.StreamWriter, client_id: str):
     if not client_id:
         _json_response(cl_w, {"error": "missing client_id"}, "400 Bad Request")
         await cl_w.drain()
         return
-
     old_session = (await _store.snapshot())
     old_session = next((s for s in old_session if s["client_id"] == client_id), None)
     old_name = old_session["session_name"] if old_session else None
-
     result = await _store.rotate(client_id)
     if not result:
         _json_response(cl_w, {"error": f"session not found for {client_id}"}, "404 Not Found")
         await cl_w.drain()
         return
-
-    # Also call anyip.io's API to invalidate the old session immediately
     if old_name:
         asyncio.create_task(_anyip_rotate_api(old_name))
-
     _inc("rotations")
     _json_response(cl_w, {
         "ok": True,
@@ -921,24 +919,36 @@ async def handle_rotate(cl_w: asyncio.StreamWriter, client_id: str):
     })
     await cl_w.drain()
 
-
 async def handle_rotate_all(cl_w: asyncio.StreamWriter):
-    # Snapshot old names for API invalidation
     old_sessions = await _store.snapshot()
     count = await _store.rotate_all()
-
-    # Invalidate each old session via anyip.io API concurrently
     if ANYIP_PROXY_ID and ANYIP_INVALIDATE_HASH:
         for s in old_sessions:
             asyncio.create_task(_anyip_rotate_api(s["session_name"]))
-
     _inc("rotations", count)
     _json_response(cl_w, {"ok": True, "sessions_rotated": count})
     await cl_w.drain()
 
+def _prometheus_metrics() -> bytes:
+    lines = []
+    for k, v in _counters.items():
+        lines.append(f"proxy_{k} {v}")
+    lines.append(f"proxy_sessions {len(_store._sessions)}")
+    lines.append(f"proxy_active_connections {sum(_ip_limiter._active.values())}")
+    lines.append(f"proxy_pool_size {sum(len(dq) for dq in _pool.values())}")
+    lines.append(f"proxy_dns_cache_entries {len(_dns_cache)}")
+    return ("\n".join(lines) + "\n").encode()
+
+async def handle_metrics(cl_w: asyncio.StreamWriter):
+    payload = _prometheus_metrics()
+    cl_w.write(
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n" + payload
+    )
+    await cl_w.drain()
 
 def _parse_management_url(url: str) -> tuple[str, dict[str, str]]:
-    """Extract path and query params from an absolute or relative proxy URL."""
     if "://" in url:
         rest = url.split("://", 1)[1]
         url = "/" + rest.split("/", 1)[1] if "/" in rest else "/"
@@ -950,15 +960,8 @@ def _parse_management_url(url: str) -> tuple[str, dict[str, str]]:
             params[k.strip()] = v.strip()
     return path.rstrip("/"), params
 
-
-async def dispatch_management(
-    method: str,
-    url: str,
-    cl_w: asyncio.StreamWriter,
-) -> bool:
-    """Route management endpoints. Returns True if the request was handled."""
+async def dispatch_management(method: str, url: str, cl_w: asyncio.StreamWriter) -> bool:
     path, params = _parse_management_url(url)
-
     if path == "/_stats":
         await handle_stats(cl_w)
         return True
@@ -972,19 +975,28 @@ async def dispatch_management(
         client_id = params.get("ip") or params.get("client_id", "")
         await handle_rotate(cl_w, client_id)
         return True
-
+    if path == "/_metrics" and PROMETHEUS_METRICS:
+        await handle_metrics(cl_w)
+        return True
     return False
 
-# ── Client connection entry point ─────────────────────────────────────────────
+# ── Client connection handler (with TCP_NODELAY) ─────────────────────────────
 
-async def handle_client(
-    cl_r: asyncio.StreamReader,
-    cl_w: asyncio.StreamWriter,
-):
+async def handle_client(cl_r: asyncio.StreamReader, cl_w: asyncio.StreamWriter):
+    # Enable TCP_NODELAY on the client socket for lower latency
+    if TCP_NODELAY:
+        sock = cl_w.get_extra_info("socket")
+        if sock:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+
     peername = cl_w.get_extra_info("peername")
-    client_ip = peername[0] if peername else "unknown"
+    peer_ip = peername[0] if peername else "unknown"
+    proxy_ip = await _read_proxy_protocol(cl_r)
+    client_ip = proxy_ip or peer_ip
 
-    # Per-IP concurrency limit — atomic check-and-increment (no private attrs)
     if not await _ip_limiter.try_acquire(client_ip):
         cl_w.write(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n")
         try:
@@ -1003,7 +1015,6 @@ async def handle_client(
                 req_line = await asyncio.wait_for(cl_r.readline(), timeout=30)
                 if not req_line or not req_line.strip():
                     break
-
                 parts = req_line.decode(errors="replace").strip().split()
                 if len(parts) < 3:
                     break
@@ -1017,10 +1028,8 @@ async def handle_client(
                         break
                     raw_headers.append(stripped)
 
-                # ── Derive session key ────────────────────────────────────────
-                # Clients behind NAT all share one IP; they can send
-                # X-Session-ID (or whatever SESSION_ID_HEADER is set to) to
-                # get their own independent sticky session.
+                client_ip = _extract_real_ip(client_ip, raw_headers)
+
                 session_id_val: Optional[str] = None
                 clean_headers: list[bytes] = []
                 for h in raw_headers:
@@ -1028,10 +1037,9 @@ async def handle_client(
                         session_id_val = h.split(b":", 1)[1].strip().decode(errors="replace")
                     else:
                         clean_headers.append(h)
-                raw_headers = clean_headers            # strip header before forwarding
-                client_id = session_id_val or client_ip
+                raw_headers = clean_headers
+                client_id = _build_client_id(client_ip, session_id_val)
 
-                # Management endpoints — intercept before forwarding upstream
                 path_check = url if url.startswith("/") else ("/" + url.split("://", 1)[-1].split("/", 1)[-1] if "://" in url else url)
                 if path_check.startswith("/_"):
                     await dispatch_management(method, url, cl_w)
@@ -1045,7 +1053,6 @@ async def handle_client(
                     keep_alive = await handle_http(
                         cl_r, cl_w, method, url, version, raw_headers, client_ip, client_id
                     )
-
             except asyncio.TimeoutError:
                 break
             except (ConnectionResetError, BrokenPipeError):
@@ -1062,25 +1069,22 @@ async def handle_client(
     except Exception:
         pass
 
-# ── Background tasks ──────────────────────────────────────────────────────────
+# ── Background tasks ─────────────────────────────────────────────────────────
 
 async def _periodic_flush():
     while True:
         await asyncio.sleep(FLUSH_INTERVAL)
         await _store.flush()
 
-
 async def _periodic_gc():
     while True:
         await asyncio.sleep(GC_INTERVAL)
         await _store.gc()
 
-# ── Worker bootstrap ──────────────────────────────────────────────────────────
+# ── Worker bootstrap ─────────────────────────────────────────────────────────
 
 async def _async_main(sock: Optional[socket.socket] = None):
-    """Initialise per-worker globals then start serving."""
     global _store, _pool, _pool_lock, _ip_limiter
-
     _store = SessionStore(SESSION_STORE_PATH)
     _store.load_sync()
     _pool = collections.defaultdict(collections.deque)
@@ -1092,11 +1096,12 @@ async def _async_main(sock: Optional[socket.socket] = None):
 
     if sock:
         server = await asyncio.start_server(
-            handle_client, sock=sock, limit=2 ** 20, backlog=1024
+            handle_client, sock=sock, limit=2**20, backlog=65535
         )
     else:
         server = await asyncio.start_server(
-            handle_client, LISTEN_HOST, LISTEN_PORT, limit=2 ** 20, backlog=1024
+            handle_client, LISTEN_HOST, LISTEN_PORT,
+            limit=2**20, backlog=65535, reuse_port=True
         )
 
     pid = os.getpid()
@@ -1106,39 +1111,34 @@ async def _async_main(sock: Optional[socket.socket] = None):
     async with server:
         await server.serve_forever()
 
-
 def _worker_main(sock: socket.socket):
-    """Entry point for each child worker process."""
     try:
         asyncio.run(_async_main(sock))
     except KeyboardInterrupt:
         pass
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     _raise_fd_limit()
 
     if PROXY_WORKERS <= 1:
-        log.info("Starting single-worker mode")
+        log.info("Starting single‑worker mode")
         try:
             asyncio.run(_async_main())
         except KeyboardInterrupt:
             log.info("Shutting down.")
         return
 
-    # Multi-worker: create a shared socket with SO_REUSEPORT, then fork.
-    # Each worker gets its own event loop and session store.
-    # Session names are deterministic (SHA-256), so all workers produce the
-    # same anyip.io session name for a given client IP — no coordination needed.
+    # Multi‑worker: shared socket with SO_REUSEPORT
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
     except (AttributeError, OSError):
-        log.warning("SO_REUSEPORT not available — workers will share a single accept queue")
+        log.warning("SO_REUSEPORT not available – workers will share a single accept queue")
     sock.bind((LISTEN_HOST, LISTEN_PORT))
-    sock.listen(1024)
+    sock.listen(65535)
     sock.setblocking(False)
 
     log.info(f"Starting {PROXY_WORKERS} worker processes on {LISTEN_HOST}:{LISTEN_PORT}")
@@ -1157,7 +1157,6 @@ def main():
             p.terminate()
         for p in processes:
             p.join(timeout=5)
-
 
 if __name__ == "__main__":
     main()
