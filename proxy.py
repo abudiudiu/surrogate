@@ -996,7 +996,9 @@ async def handle_client(cl_r: asyncio.StreamReader, cl_w: asyncio.StreamWriter):
     peer_ip = peername[0] if peername else "unknown"
     proxy_ip = await _read_proxy_protocol(cl_r)
     client_ip = proxy_ip or peer_ip
-
+    log.debug(
+        f"Connection accepted: peer_ip={peer_ip} proxy_ip={proxy_ip or '-'} client_ip={client_ip}"
+    )
     if not await _ip_limiter.try_acquire(client_ip):
         cl_w.write(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n")
         try:
@@ -1028,10 +1030,16 @@ async def handle_client(cl_r: asyncio.StreamReader, cl_w: asyncio.StreamWriter):
                         break
                     raw_headers.append(stripped)
 
-                client_ip = _extract_real_ip(client_ip, raw_headers)
+                extracted_client_ip = _extract_real_ip(client_ip, raw_headers)
+                if extracted_client_ip != client_ip:
+                    log.debug(
+                        f"Client IP updated from headers: peer_ip={peer_ip} previous_client_ip={client_ip} client_ip={extracted_client_ip}"
+                    )
+                client_ip = extracted_client_ip
 
                 session_id_val: Optional[str] = None
                 clean_headers: list[bytes] = []
+                log.warning(f"RAW HEADERS from {peer_ip}: {[h.decode(errors='ignore') for h in raw_headers]}")
                 for h in raw_headers:
                     if h.lower().startswith(SESSION_ID_HEADER + b":"):
                         session_id_val = h.split(b":", 1)[1].strip().decode(errors="replace")
@@ -1068,7 +1076,6 @@ async def handle_client(cl_r: asyncio.StreamReader, cl_w: asyncio.StreamWriter):
         await cl_w.wait_closed()
     except Exception:
         pass
-
 # ── Background tasks ─────────────────────────────────────────────────────────
 
 async def _periodic_flush():
